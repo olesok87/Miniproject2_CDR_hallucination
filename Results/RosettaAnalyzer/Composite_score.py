@@ -1,141 +1,150 @@
-# ----------------------------
-# Composite scoring from Rosetta and PISA metrics
-# ----------------------------
+import re
+import matplotlib.pyplot as plt
+import matplotlib as mpl
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
 from pathlib import Path
-import re
 
-# ----------------------------
-# Helper functions
-# ----------------------------
-def normalize_minmax(series):
-    """Standard min-max normalization to [0,1]"""
-    if series.max() == series.min():
-        return pd.Series(0.5, index=series.index)  # avoid div by zero
-    return (series - series.min()) / (series.max() - series.min())
+def short_label(name: str) -> str:
+    """
+    Robustly shorten model names to 'dX.nY' style when possible.
+    Examples:
+      'd1_n1_relaxed' -> 'd1.n1'
+      'prefix_d0n2_suffix' -> 'd0.n2'
+      'relaxed_WT' -> 'WT'
+      'some_long_name' -> 'some.long.name' (fallback)
+    """
+    s = str(name)
 
-def normalize_inverted(series):
-    """Inverted min-max normalization: lower is better"""
-    if series.max() == series.min():
-        return pd.Series(0.5, index=series.index)
-    return (series.max() - series) / (series.max() - series.min())
+    # 1) find d<number> and n<number> anywhere (allow separators _, -, ., nothing)
+    m = re.search(r"(d\d+)", s, flags=re.IGNORECASE)
+    n = re.search(r"(n\d+)", s, flags=re.IGNORECASE)
 
-def short_label(name):
-    if pd.isna(name):
-        return "unknown"
-    name = str(name)  # ensure it’s a string
-    m = re.search(r"design(\d+)_n(\d+)", name)
-    if m:
-        return f"d{m.group(1)}.n{m.group(2)}"
-    m2 = re.search(r"d(?:esign)?[_-]?(\d+)[^A-Za-z0-9]*n[_-]?(\d+)", name)
-    if m2:
-        return f"d{m2.group(1)}.n{m2.group(2)}"
-    return (name[:20] + "...") if len(name) > 23 else name
+    if m and n:
+        # return canonical lowercase 'dX.nY'
+        dpart = m.group(1).lower()
+        npart = n.group(1).lower()
+        return f"{dpart}.{npart}"
+    elif m:
+        return m.group(1).lower()
+    elif n:
+        return n.group(1).lower()
 
+    # 2) fallback: remove common suffixes and compress underscores to dots
+    # remove trailing '_relaxed' or similar common suffixes
+    s2 = re.sub(r"(_relaxed|\.relaxed|-relaxed)$", "", s, flags=re.IGNORECASE)
+    s2 = re.sub(r"\.(pdb|pdbqt|ent)$", "", s2, flags=re.IGNORECASE)
+    # if it contains 'WT' or 'wildtype', normalize to 'WT'
+    if re.search(r"\bWT\b", s2, flags=re.IGNORECASE) or re.search(r"wild.?type", s2, flags=re.IGNORECASE):
+        return "WT"
 
+    # replace underscores and hyphens with dots, collapse repeated dots
+    s2 = re.sub(r"[_\-]+", ".", s2)
+    s2 = re.sub(r"\.+", ".", s2).strip(".")
+    # if still long, return only the first two chunks separated by dots
+    parts = s2.split(".")
+    if len(parts) > 2:
+        return ".".join(parts[:2])
+    return s2 or s
 
-# ----------------------------
-# Main function
-# ----------------------------
-def combine_rosetta_pisa(rosetta_csv, pisa_csv, out_csv, out_png, exclude_patterns=None):
-    # --- Load CSVs ---
-    df_r = pd.read_csv(rosetta_csv)
-    df_p = pd.read_csv(pisa_csv)
+def plot_from_scored_csv_vertical(
+    csv_path,
+    out_png,
+    figsize=(14, 7),
+    xlabel="Model",
+    ylabel="Composite score (higher = better)",
+    exclude_patterns=None,
+):
+    p = Path(csv_path)
+    if not p.exists():
+        raise FileNotFoundError(f"{csv_path} not found")
 
-    # --- Keep only necessary columns for scoring ---
-    # Rosetta
-    df_r_sub = df_r[['description','dG_separated','dSASA_int','hbonds_int']].copy()
-    # PISA
-    df_p_sub = df_p[['filename','int_area','stab_en','n_hbonds','pvalue']].copy()
+    df = pd.read_csv(p)
+    if not {"description", "composite_score", "color"}.issubset(df.columns):
+        raise ValueError("CSV must contain columns: description, composite_score, color")
 
-    # --- Normalize Rosetta metrics ---
-    df_r_sub['dG_norm'] = normalize_inverted(df_r_sub['dG_separated'])
-    df_r_sub['area_norm'] = normalize_minmax(df_r_sub['dSASA_int'])
-    df_r_sub['hbonds_norm'] = normalize_minmax(df_r_sub['hbonds_int'])
-
-    # --- Rosetta score (weights rescaled to sum=1) ---
-    df_r_sub['Rosetta_score'] = (
-            0.444 * df_r_sub['dG_norm'] +
-            0.333 * df_r_sub['area_norm'] +
-            0.222 * df_r_sub['hbonds_norm']
-    )
-
-    # --- Normalize PISA metrics ---
-    df_p_sub['area_norm'] = normalize_minmax(df_p_sub['int_area'])
-    df_p_sub['stab_norm'] = normalize_inverted(df_p_sub['stab_en'])
-    df_p_sub['hbonds_norm'] = normalize_minmax(df_p_sub['n_hbonds'])
-    df_p_sub['pval_norm'] = normalize_inverted(df_p_sub['pvalue'])
-
-    # --- PISA score ---
-    df_p_sub['PISA_score'] = (
-        0.4*df_p_sub['area_norm'] +
-        0.3*df_p_sub['stab_norm'] +
-        0.2*df_p_sub['hbonds_norm'] +
-        0.1*df_p_sub['pval_norm']
-    )
-
-    # --- Merge Rosetta and PISA scores ---
-    # Align names (basic heuristic: remove 'relaxed_' prefix from Rosetta description)
-    df_r_sub['merge_name'] = df_r_sub['description'].str.replace(r"^relaxed_", "", regex=True).str.replace(r"_\d{4}_\d{4}$", "", regex=True)
-    df_p_sub['merge_name'] = df_p_sub['filename'].str.replace(r"_relaxed$", "", regex=True)
-
-    df_merged = pd.merge(df_r_sub, df_p_sub, on='merge_name', how='outer', suffixes=('_R','_P'))
-
-    # Fill missing PISA_score with 0
-    df_merged['PISA_score'] = df_merged['PISA_score'].fillna(0.0)
-
-    # --- Normalize Rosetta_score and PISA_score across all models ---
-    df_merged['Rosetta_score_norm'] = normalize_minmax(df_merged['Rosetta_score'])
-    df_merged['PISA_score_norm'] = normalize_minmax(df_merged['PISA_score'])
-
-    # --- Composite score ---
-    df_merged['composite_score'] = 0.7*df_merged['Rosetta_score_norm'] + 0.3*df_merged['PISA_score_norm']
-
-    # --- Optional: apply exclusions ---
+    # apply exclusions
     if exclude_patterns:
-        mask = pd.Series(False, index=df_merged.index)
+        mask = pd.Series(False, index=df.index)
         for pat in exclude_patterns:
-            mask = mask | df_merged['description'].astype(str).str.contains(pat, regex=True)
-        df_merged = df_merged[~mask]
+            mask |= df["description"].astype(str).str.contains(pat, regex=True)
+        df = df[~mask].reset_index(drop=True)
 
-    # --- Save CSV ---
-    df_merged.to_csv(out_csv, index=False)
-    print(f"Saved combined scores to: {out_csv}")
+    if df.empty:
+        raise ValueError("No rows left to plot after exclusions")
 
-    # --- Plot vertical bar ---
-    labels = df_merged['description'].astype(str).map(short_label).tolist()
-    scores = df_merged['composite_score'].to_numpy()
+    # create short labels using the robust short_label function
+    df["short"] = df["description"].astype(str).map(short_label)
+
+    # sort descending by composite_score
+    plot_df = df[["short", "composite_score"]].copy()
+    plot_df = plot_df.sort_values("composite_score", ascending=False).reset_index(drop=True)
+
+    labels = plot_df["short"].tolist()
+    scores = plot_df["composite_score"].astype(float).to_numpy()
+
+    # build colormap red -> yellow -> green based on normalized scores
+    cmap = mpl.colors.LinearSegmentedColormap.from_list("red_yellow_green", ["#d62728", "#ffcc00", "#2ca02c"])
+    # normalize between min and max of scores to color scale
+    norm = mpl.colors.Normalize(vmin=np.nanmin(scores), vmax=np.nanmax(scores))
+    bar_colors = [cmap(norm(s)) for s in scores]
+
     x = np.arange(len(labels))
-    fig, ax = plt.subplots(figsize=(14,7))
-    bars = ax.bar(x, scores, color="#1f77b4", edgecolor="#222222", linewidth=0.6)
+    fig, ax = plt.subplots(figsize=figsize)
+    bars = ax.bar(x, scores, color=bar_colors, edgecolor="#222222", linewidth=0.6)
+
     ax.set_xticks(x)
     ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=11)
-    ax.set_ylabel("Composite score (higher = better)", fontsize=12)
-    ax.set_xlabel("Model", fontsize=11)
+    ax.set_ylabel(ylabel, fontsize=12)
+    ax.set_xlabel(xlabel, fontsize=11)
 
-    # annotate
-    y_off = 0.01*max(1.0, np.nanmax(np.abs(scores)))
+    # annotate numeric score above bars (closer and lighter)
+    y_off_unit = 0.003 * max(1.0, np.nanmax(np.abs(scores)))
     for rect, v in zip(bars, scores):
-        ax.text(rect.get_x()+rect.get_width()/2, rect.get_height()+y_off, f"{v:.3f}", ha="center", va="bottom", fontsize=9, color="#111111")
+        if np.isfinite(v):
+            ax.text(
+                rect.get_x() + rect.get_width() / 2,
+                rect.get_height() + y_off_unit,
+                f"{v:.3f}",
+                ha="center",
+                va="bottom",
+                fontsize=8,
+                fontweight="normal",
+                color="#222222",
+            )
 
-    ax.grid(axis="y", linestyle="--", linewidth=0.4, alpha=0.6)
-    plt.title("Composite Scores from Rosetta + PISA", fontsize=13)
+    # highlight top model label
+    if len(plot_df) > 0:
+        ax.get_xticklabels()[0].set_fontweight("bold")
+        ax.get_xticklabels()[0].set_color("#2ca02c")
+        winner_desc = plot_df.loc[0, "short"]
+    else:
+        winner_desc = None
+
+    # grid and colorbar
+    ax.grid(axis="y", linestyle="--", linewidth=0.5, alpha=0.6)
+    sm = mpl.cm.ScalarMappable(cmap=cmap, norm=norm)
+    sm.set_array([])
+    cbar = plt.colorbar(sm, ax=ax, pad=0.02)
+    cbar.set_label("Quality (red = worst → green = best)", fontsize=10)
+    cbar.ax.tick_params(labelsize=9)
+
+    # title
+    plt.title("Rosetta Interface Analyzer Composite Score", fontsize=14, weight="semibold")
     plt.tight_layout()
-    plt.savefig(out_png, dpi=300, bbox_inches="tight")
+
+    outpath = Path(out_png)
+    plt.savefig(outpath, dpi=300, bbox_inches="tight")
+    print(f"✅ Saved vertical plot to: {outpath} — winner: {winner_desc}")
     plt.show()
-    print(f"Saved plot to: {out_png}")
 
-    return df_merged
 
 # ----------------------------
-# Example usage
+# Call the function with your paths and exclude pattern for the 6Y6C row
 # ----------------------------
-if __name__ == "__main__":
-    rosetta_csv = r"C:\Users\aszyk\PycharmProjects\Miniproject 2 (CDR hallucination)\Results\RosettaAnalyzer\parsed_metrics.csv"
-    pisa_csv = r"C:\Users\aszyk\PycharmProjects\Miniproject 2 (CDR hallucination)\Results\PISA\pisa_interfaces_summary.csv"
-    out_csv = r"C:\Users\aszyk\PycharmProjects\Miniproject 2 (CDR hallucination)\Results\combined_scores.csv"
-    out_png = r"C:\Users\aszyk\PycharmProjects\Miniproject 2 (CDR hallucination)\Results\combined_scores.png"
+csv_path = r"C:\Users\aszyk\PycharmProjects\Miniproject 2 (CDR hallucination)\Results\RosettaAnalyzer\parsed_metrics_scored.csv"
+out_png = r"C:\Users\aszyk\PycharmProjects\Miniproject 2 (CDR hallucination)\Results\RosettaAnalyzer\composite_scores_from_csv.png"
 
-    combine_rosetta_pisa(rosetta_csv, pisa_csv, out_csv, out_png, exclude_patterns=[r"6Y6C"])
+# exclude any description containing '6Y6C' or the full WT pattern; adjust pattern if needed
+plot_from_scored_csv_vertical(csv_path=csv_path, out_png=out_png, figsize=(9,8),
+                              exclude_patterns=[r"6Y6C", r"relaxed_6Y6C"])

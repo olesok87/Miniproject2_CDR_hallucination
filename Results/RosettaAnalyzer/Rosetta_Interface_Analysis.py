@@ -20,13 +20,14 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import matplotlib as mpl
 import csv
+from pathlib import Path
 
 
 sns.set(style="whitegrid", context="notebook")
 
 # ===== USER CONFIG =====
-SCORE_PATH = r"/Results/RosettaAnalyzer/score.sc"
-OUT_PNG = r"C:\Users\aszyk\PycharmProjects\Miniproject 2 (CDR hallucination)\Results\RosettaAnalyzer\Interface_Analyzer_Eosetta.png"
+SCORE_PATH = r"C:\Users\aszyk\PycharmProjects\Miniproject 2 (CDR hallucination)\Results\RosettaAnalyzer\score.sc"
+OUT_PNG = r"C:\Users\aszyk\PycharmProjects\Miniproject 2 (CDR hallucination)\Results\RosettaAnalyzer\Interface_Analyzer_Rosetta.png"
 # Custom model labels (the user requested six names). The script will map these onto the rows.
 CUSTOM_LABELS = ["WT (6y6C)", "d0.n0", "d1.n0", "d1.n1", "d1.n2", "d1.n3"]
 # Increase overall figure/text size
@@ -376,20 +377,147 @@ def plot_with_colormap(tdf, is_pair, numeric_data, quality, out_png, custom_labe
     print(f"Saved figure to: {out_png}")
     plt.show()
 
+def plot_from_scored_csv_vertical(
+    csv_path,
+    out_png,
+    figsize=(14, 7),
+    xlabel="Model",
+    ylabel="Composite score (higher = better)",
+    exclude_patterns=None,
+):
+    p = Path(csv_path)
+    if not p.exists():
+        raise FileNotFoundError(f"{csv_path} not found")
+
+    df = pd.read_csv(p)
+
+    # require description; allow composite_score OR derive it from available *_quality columns
+    if "description" not in df.columns:
+        raise ValueError("CSV must contain column: description")
+
+    if "composite_score" not in df.columns:
+        quality_cols = [c for c in df.columns if c.endswith("_quality")]
+        if len(quality_cols) == 0:
+            raise ValueError(
+                "CSV must contain either column: composite_score or at least one '*_quality' column"
+            )
+        # compute composite_score as mean of available quality columns (ignoring NaNs)
+        df["composite_score"] = df[quality_cols].mean(axis=1, skipna=True)
+
+    # apply exclusions
+    if exclude_patterns:
+        mask = pd.Series(False, index=df.index)
+        for pat in exclude_patterns:
+            mask |= df["description"].astype(str).str.contains(pat, regex=True)
+        df = df[~mask].reset_index(drop=True)
+
+    if df.empty:
+        raise ValueError("No rows left to plot after exclusions")
+
+    # create short labels using the robust short_label function
+    df["short"] = df["description"].astype(str).map(short_label)
+
+    # sort descending by composite_score
+    plot_df = df[["short", "composite_score"]].copy()
+    plot_df = plot_df.sort_values("composite_score", ascending=False).reset_index(drop=True)
+
+    labels = plot_df["short"].tolist()
+    scores = plot_df["composite_score"].astype(float).to_numpy()
+
+    # build colormap red -> yellow -> green based on normalized scores
+    cmap = mpl.colors.LinearSegmentedColormap.from_list(
+        "red_yellow_green", ["#d62728", "#ffcc00", "#2ca02c"]
+    )
+
+    # handle all-NaN or constant arrays robustly
+    if np.all(~np.isfinite(scores)):
+        # fallback uniform gray if no finite scores
+        norm = mpl.colors.Normalize(vmin=0.0, vmax=1.0)
+        bar_colors = [(0.7, 0.7, 0.7, 1.0) for _ in scores]
+    else:
+        finite_scores = scores[np.isfinite(scores)]
+        vmin = np.nanmin(finite_scores)
+        vmax = np.nanmax(finite_scores)
+        if math.isclose(vmin, vmax):
+            # avoid zero-range normalize
+            norm = mpl.colors.Normalize(vmin=vmin - 0.5, vmax=vmax + 0.5)
+        else:
+            norm = mpl.colors.Normalize(vmin=vmin, vmax=vmax)
+        bar_colors = [cmap(norm(s)) if np.isfinite(s) else (0.7, 0.7, 0.7, 1.0) for s in scores]
+
+    x = np.arange(len(labels))
+    fig, ax = plt.subplots(figsize=figsize)
+    bars = ax.bar(x, scores, color=bar_colors, edgecolor="#222222", linewidth=0.6)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=11)
+    ax.set_ylabel(ylabel, fontsize=12)
+    ax.set_xlabel(xlabel, fontsize=11)
+
+    # annotate numeric score above bars (closer and lighter)
+    max_abs = 1.0 if not np.isfinite(np.nanmax(np.abs(scores))) else np.nanmax(np.abs(scores))
+    y_off_unit = 0.003 * max(1.0, max_abs)
+    for rect, v in zip(bars, scores):
+        if np.isfinite(v):
+            ax.text(
+                rect.get_x() + rect.get_width() / 2,
+                rect.get_height() + y_off_unit,
+                f"{v:.3f}",
+                ha="center",
+                va="bottom",
+                fontsize=8,
+                fontweight="normal",
+                color="#222222",
+            )
+
+    # highlight top model label
+    if len(plot_df) > 0:
+        xticks = ax.get_xticklabels()
+        if len(xticks) > 0:
+            xticks[0].set_fontweight("bold")
+            xticks[0].set_color("#2ca02c")
+        winner_desc = plot_df.loc[0, "short"]
+    else:
+        winner_desc = None
+
+    # grid and colorbar
+    ax.grid(axis="y", linestyle="--", linewidth=0.5, alpha=0.6)
+    sm = mpl.cm.ScalarMappable(cmap=cmap, norm=norm)
+    sm.set_array([])
+    cbar = plt.colorbar(sm, ax=ax, pad=0.02)
+    cbar.set_label("Quality (red = worst → green = best)", fontsize=10)
+    cbar.ax.tick_params(labelsize=9)
+
+    # title
+    plt.title("Rosetta Interface Analyzer Composite Score", fontsize=14, weight="semibold")
+    plt.tight_layout()
+
+    outpath = Path(out_png)
+    plt.savefig(outpath, dpi=300, bbox_inches="tight")
+    print(f"✅ Saved vertical plot to: {outpath} — winner: {winner_desc}")
+    plt.show()
+
 
 def main():
-    df = parse_scorefile(SCORE_PATH)
-    tdf, is_pair, numeric_data = prepare_data(df)
-    quality = compute_quality_arrays(tdf, is_pair, numeric_data)
+    try:
+        df = parse_scorefile(SCORE_PATH)
+        tdf, is_pair, numeric_data = prepare_data(df)
+        quality = compute_quality_arrays(tdf, is_pair, numeric_data)
 
-    # save the csv
-    OUT_CSV = r"C:\Users\aszyk\PycharmProjects\Miniproject 2 (CDR hallucination)\Results\RosettaAnalyzer\parsed_metrics.csv"
-    save_parsed_metrics_csv(df, tdf, is_pair, numeric_data, quality, OUT_CSV)
+        OUT_CSV = r"C:\Users\aszyk\PycharmProjects\Miniproject 2 (CDR hallucination)\Results\RosettaAnalyzer\parsed_metrics.csv"
+        save_parsed_metrics_csv(df, tdf, is_pair, numeric_data, quality, OUT_CSV)
 
-    # replace the DataFrame 'description' labels with the custom labels if the count matches
-    # (we do this when plotting via assign_custom_labels; keep tdf descriptions for record)
-    plot_with_colormap(tdf, is_pair, numeric_data, quality, OUT_PNG, CUSTOM_LABELS)
+        # main plot with custom labels
+        plot_with_colormap(tdf, is_pair, numeric_data, quality, OUT_PNG, CUSTOM_LABELS)
 
+        # add short labels and create vertical composite-score plot from CSV
+        tdf["short"] = tdf["description"].astype(str).map(short_label)
+        csv_path = OUT_CSV
+        out_png = r"C:\Users\aszyk\PycharmProjects\Miniproject 2 (CDR hallucination)\Results\RosettaAnalyzer\composite_scores_from_csv.png"
+        plot_from_scored_csv_vertical(csv_path, out_png, figsize=(14, 7), xlabel="Model",
+                                      ylabel="Composite score (higher = better)", exclude_patterns=None)
+    except Exception as e:
+        print(f"Error in main: {e}")
 
 if __name__ == "__main__":
     main()
