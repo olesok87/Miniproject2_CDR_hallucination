@@ -4,7 +4,7 @@ import matplotlib as mpl
 import numpy as np
 
 # === 1. Read CSV ===
-df = pd.read_csv(r"/Results/PISA/pisa_interfaces_summary.csv")
+df = pd.read_csv(r"C:\Users\aszyk\PycharmProjects\Miniproject 2 (CDR hallucination)\Results\PISA\pisa_interfaces_summary.csv")
 
 
 # === 2. Normalize metrics (0–1 scale, 1 = best) ===
@@ -25,7 +25,7 @@ df["PISA_score"] = (
 )
 
 # === 4. Filter out WT ===
-df_plot = df[~df["filename"].str.contains("WT", case=False)].copy()
+df_plot = df.copy()
 
 # === 5. Format labels and sort ===
 df_plot["label"] = (
