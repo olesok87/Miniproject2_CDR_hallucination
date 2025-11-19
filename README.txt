@@ -1,7 +1,7 @@
 RUN:
 
 0. Go to my Google Colab to find out how to run AlphaFold, RFDiffusion and protein MPNN 
-https://github.com/olesok87/Miniproject2_CDR_hallucination_Google_Colab.git
+https://github.com/olesok87/Miniproject2_CDR_hallucination_Google_Colab.git or CDR hallucination.ipnyb file in this commit
 
 1. In the Script folder you will find script scoring data from Rosetta and PISA for protein-protein docking models. The scoring scheme combines metrics from both tools to evaluate the quality of the docking interfaces.
 
